@@ -3,7 +3,6 @@
 import argparse
 import json
 import random
-import re
 from pathlib import Path
 
 import torch
@@ -14,7 +13,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(REPO_ROOT))
 
-from cs336_alignment.drgrpo_grader import question_only_reward_fn
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 
 def load_jsonl(path: str, max_examples: int | None = None, seed: int = 0):
@@ -33,16 +32,13 @@ def load_jsonl(path: str, max_examples: int | None = None, seed: int = 0):
     return examples
 
 
-def get_prompt_and_ground_truth(item: dict):
-    """
-    这里保留你当前 GSM8K 数据格式：
-        question -> prompt
-        answer   -> ground_truth
+def load_prompt_template(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8").strip()
 
-    如果你以后换成 MATH 的 prompt/response 格式，只改这个函数就行。
-    """
-    prompt = item["question"]
-    ground_truth = item["answer"]
+
+def get_prompt_and_ground_truth(item: dict, prompt_template: str):
+    prompt = prompt_template.format(question=item["question"])
+    ground_truth = extract_gsm8k_final_answer(item["answer"])
     return prompt, ground_truth
 
 
@@ -54,56 +50,12 @@ def extract_gsm8k_final_answer(answer: str) -> str:
     return answer.strip()
 
 
-def extract_last_number(text: str) -> str | None:
-    """Fallback for generations that give a final number without GSM8K marker."""
-    matches = re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)
-    if not matches:
-        return None
-    return matches[-1].replace(",", "")
-
-
-def gsm8k_question_only_reward_fn(
-    response: str,
-    ground_truth: str,
-    fast: bool = True,
-) -> dict[str, float]:
-    """
-    Grade GSM8K-style SFT outputs.
-
-    The assignment's question_only_reward_fn expects answers in \\boxed{...}.
-    Our SFT targets use GSM8K's original "#### final_answer" format, so we
-    convert the extracted final answer to boxed form before calling it.
-    """
-    ground_truth_answer = extract_gsm8k_final_answer(ground_truth)
-
-    if "\\boxed" in response:
-        reward_response = response
-    else:
-        if "####" in response:
-            model_answer = extract_gsm8k_final_answer(response)
-        else:
-            model_answer = extract_last_number(response)
-
-        if model_answer is None:
-            return {
-                "format_reward": 0.0,
-                "answer_reward": 0.0,
-                "reward": 0.0,
-            }
-        reward_response = f"\\boxed{{{model_answer}}}"
-
-    return question_only_reward_fn(
-        response=reward_response,
-        ground_truth=ground_truth_answer,
-        fast=fast,
-    )
-
-
 @torch.no_grad()
 def evaluate(
     model,
     tokenizer,
     examples,
+    prompt_template: str,
     device: str,
     max_new_tokens: int = 512,
     debug_examples: int = 3,
@@ -116,7 +68,10 @@ def evaluate(
     records = []
 
     for item in tqdm(examples):
-        prompt, ground_truth = get_prompt_and_ground_truth(item)
+        prompt, ground_truth = get_prompt_and_ground_truth(
+            item=item,
+            prompt_template=prompt_template,
+        )
 
         inputs = tokenizer(
             prompt,
@@ -139,8 +94,9 @@ def evaluate(
             skip_special_tokens=True,
         )
 
-        reward_info = gsm8k_question_only_reward_fn(
-            response=response,
+        response_for_reward = "<think>" + response
+        reward_info = r1_zero_reward_fn(
+            response=response_for_reward,
             ground_truth=ground_truth,
             fast=fast,
         )
@@ -165,6 +121,7 @@ def evaluate(
                 "prompt": prompt,
                 "ground_truth": ground_truth,
                 "response": response,
+                "response_for_reward": response_for_reward,
                 "reward_info": reward_info,
                 "is_correct": is_correct,
             }
@@ -189,6 +146,14 @@ def parse_args():
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--eval-path", type=str, required=True)
     parser.add_argument("--output-path", type=str, required=True)
+    parser.add_argument(
+        "--prompt-path",
+        type=str,
+        default=(
+            "/root/autodl-tmp/assignment5-alignment-main/"
+            "cs336_alignment/prompts/r1_zero.prompt"
+        ),
+    )
 
     parser.add_argument("--max-examples", type=str, default="100")
     parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -228,6 +193,8 @@ def main():
         attn_implementation="flash_attention_2",
     ).to(device)
 
+    prompt_template = load_prompt_template(args.prompt_path)
+
     examples = load_jsonl(
         path=args.eval_path,
         max_examples=max_examples,
@@ -240,6 +207,7 @@ def main():
         model=model,
         tokenizer=tokenizer,
         examples=examples,
+        prompt_template=prompt_template,
         device=device,
         max_new_tokens=args.max_new_tokens,
         debug_examples=args.debug_examples,
@@ -249,6 +217,7 @@ def main():
     summary = {
         "model_path": args.model_path,
         "eval_path": args.eval_path,
+        "prompt_path": args.prompt_path,
         "accuracy": result["accuracy"],
         "correct": result["correct"],
         "total": result["total"],

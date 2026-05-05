@@ -20,6 +20,10 @@ from homework.sft_train_step import sft_microbatch_train_step
 class SFTConfig:
     model_path: str = "/root/autodl-tmp/models/Qwen2.5-Math-1.5B"
     train_path: str = "/root/autodl-tmp/assignment5-alignment-main/data/gsm8k/train.jsonl"
+    prompt_path: str = (
+        "/root/autodl-tmp/assignment5-alignment-main/"
+        "cs336_alignment/prompts/r1_zero.prompt"
+    )
     output_dir: str = "./checkpoints/sft_debug_128"
 
     max_examples: int | None = 128
@@ -41,10 +45,14 @@ class SFTDataset(Dataset):
     def __init__(
         self,
         path: str,
+        prompt_path: str,
         max_examples: int | None = None,
         seed: int = 0,
     ):
         self.examples = []
+        self.prompt_template = Path(prompt_path).read_text(
+            encoding="utf-8",
+        ).strip()
 
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -61,11 +69,21 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, idx: int):
         item = self.examples[idx]
+        reasoning, final_answer = format_gsm8k_r1_response_parts(item["answer"])
 
         return {
-            "prompt": item["question"],
-            "response": item["answer"],
+            "prompt": self.prompt_template.format(question=item["question"]),
+            "response": f"{reasoning}\n</think> <answer>{final_answer}</answer>",
         }
+
+
+def format_gsm8k_r1_response_parts(answer: str) -> tuple[str, str]:
+    marker = "####"
+    if marker not in answer:
+        raise ValueError(f"GSM8K answer is missing final-answer marker {marker!r}")
+
+    reasoning, final_answer = answer.rsplit(marker, maxsplit=1)
+    return reasoning.strip(), final_answer.strip()
 
 
 def make_collate_fn(tokenizer):
@@ -162,6 +180,7 @@ def train_sft(cfg: SFTConfig):
 
     train_dataset = SFTDataset(
         path=cfg.train_path,
+        prompt_path=cfg.prompt_path,
         max_examples=cfg.max_examples,
         seed=cfg.seed,
     )
