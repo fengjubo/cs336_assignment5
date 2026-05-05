@@ -150,8 +150,7 @@ def parse_args():
         "--prompt-path",
         type=str,
         default=(
-            "/root/autodl-tmp/assignment5-alignment-main/"
-            "cs336_alignment/prompts/r1_zero.prompt"
+            "/root/autodl-tmp/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt"
         ),
     )
 

@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-path",
         type=Path,
-        default=REPO_ROOT / "cs336_alignment" / "prompts" / "r1_zero.prompt",
+        default="/root/autodl-tmp/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt",
         help="Path to the r1_zero prompt template.",
     )
     parser.add_argument(

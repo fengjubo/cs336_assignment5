@@ -1,7 +1,9 @@
 # train_sft.py
 
+import argparse
 import json
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +11,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
 
 # homework/train_sft.py
 from homework.helpers import tokenize_prompt_and_output, get_response_log_probs
@@ -21,8 +26,7 @@ class SFTConfig:
     model_path: str = "/root/autodl-tmp/models/Qwen2.5-Math-1.5B"
     train_path: str = "/root/autodl-tmp/assignment5-alignment-main/data/gsm8k/train.jsonl"
     prompt_path: str = (
-        "/root/autodl-tmp/assignment5-alignment-main/"
-        "cs336_alignment/prompts/r1_zero.prompt"
+        "/root/autodl-tmp/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt"
     )
     output_dir: str = "./checkpoints/sft_debug_128"
 
@@ -36,6 +40,7 @@ class SFTConfig:
 
     seed: int = 0
     log_every: int = 1
+    save_every: int = 8
 
     sample_generations: int = 3
     sample_max_new_tokens: int = 256
@@ -104,6 +109,16 @@ def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def save_checkpoint(model, tokenizer, output_dir: str | Path):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Saving model to {output_dir}")
+
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
 
 @torch.no_grad()
@@ -200,15 +215,18 @@ def train_sft(cfg: SFTConfig):
     print(f"Number of training examples: {len(train_dataset)}")
     print(f"Batch size: {cfg.batch_size}")
     print(f"Gradient accumulation steps: {cfg.gradient_accumulation_steps}")
+    print(f"Save every optimizer steps: {cfg.save_every}")
 
     global_step = 0
     micro_step = 0
+    examples_seen = 0
 
     optimizer.zero_grad()
 
     for epoch in range(cfg.num_epochs):
         for batch_idx, batch in enumerate(train_loader):
             micro_step += 1
+            examples_seen += batch["input_ids"].shape[0]
 
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
@@ -252,11 +270,20 @@ def train_sft(cfg: SFTConfig):
                         f"epoch={epoch} "
                         f"global_step={global_step} "
                         f"micro_step={micro_step} "
+                        f"examples_seen={examples_seen} "
                         f"loss={loss.item():.6f} "
                         f"loss_before_accum="
                         f"{metadata['loss_before_grad_accum'].item():.6f} "
                         f"num_response_tokens="
                         f"{metadata['num_response_tokens'].item()}"
+                    )
+
+                if global_step % cfg.save_every == 0:
+                    checkpoint_dir = Path(cfg.output_dir) / f"checkpoint-step-{global_step}"
+                    save_checkpoint(
+                        model=model,
+                        tokenizer=tokenizer,
+                        output_dir=checkpoint_dir,
                     )
 
     if micro_step > 0 and micro_step % cfg.gradient_accumulation_steps != 0:
@@ -270,15 +297,23 @@ def train_sft(cfg: SFTConfig):
         print(
             f"global_step={global_step} "
             f"micro_step={micro_step} "
+            f"examples_seen={examples_seen} "
             "applied final partial gradient accumulation step"
         )
 
-    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        if global_step % cfg.save_every == 0:
+            checkpoint_dir = Path(cfg.output_dir) / f"checkpoint-step-{global_step}"
+            save_checkpoint(
+                model=model,
+                tokenizer=tokenizer,
+                output_dir=checkpoint_dir,
+            )
 
-    print(f"Saving model to {cfg.output_dir}")
-
-    model.save_pretrained(cfg.output_dir)
-    tokenizer.save_pretrained(cfg.output_dir)
+    save_checkpoint(
+        model=model,
+        tokenizer=tokenizer,
+        output_dir=cfg.output_dir,
+    )
 
     print_sample_generations(
         model=model,
@@ -294,6 +329,71 @@ def train_sft(cfg: SFTConfig):
     return model, tokenizer
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--model-path", type=str, default=SFTConfig.model_path)
+    parser.add_argument("--train-path", type=str, default=SFTConfig.train_path)
+    parser.add_argument("--prompt-path", type=str, default=SFTConfig.prompt_path)
+    parser.add_argument("--output-dir", type=str, default=SFTConfig.output_dir)
+    parser.add_argument("--max-examples", type=str, default=str(SFTConfig.max_examples))
+
+    parser.add_argument("--batch-size", type=int, default=SFTConfig.batch_size)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=SFTConfig.gradient_accumulation_steps,
+    )
+    parser.add_argument("--learning-rate", type=float, default=SFTConfig.learning_rate)
+    parser.add_argument("--num-epochs", type=int, default=SFTConfig.num_epochs)
+    parser.add_argument("--max-grad-norm", type=float, default=SFTConfig.max_grad_norm)
+
+    parser.add_argument("--seed", type=int, default=SFTConfig.seed)
+    parser.add_argument("--log-every", type=int, default=SFTConfig.log_every)
+    parser.add_argument("--save-every", type=int, default=SFTConfig.save_every)
+
+    parser.add_argument(
+        "--sample-generations",
+        type=int,
+        default=SFTConfig.sample_generations,
+    )
+    parser.add_argument(
+        "--sample-max-new-tokens",
+        type=int,
+        default=SFTConfig.sample_max_new_tokens,
+    )
+
+    return parser.parse_args()
+
+
+def config_from_args(args) -> SFTConfig:
+    if args.max_examples == "full":
+        max_examples = None
+    else:
+        max_examples = int(args.max_examples)
+
+    if args.save_every <= 0:
+        raise ValueError("--save-every must be a positive integer.")
+
+    return SFTConfig(
+        model_path=args.model_path,
+        train_path=args.train_path,
+        prompt_path=args.prompt_path,
+        output_dir=args.output_dir,
+        max_examples=max_examples,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        num_epochs=args.num_epochs,
+        max_grad_norm=args.max_grad_norm,
+        seed=args.seed,
+        log_every=args.log_every,
+        save_every=args.save_every,
+        sample_generations=args.sample_generations,
+        sample_max_new_tokens=args.sample_max_new_tokens,
+    )
+
+
 if __name__ == "__main__":
-    cfg = SFTConfig()
+    cfg = config_from_args(parse_args())
     train_sft(cfg)
