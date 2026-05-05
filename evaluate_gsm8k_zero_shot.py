@@ -11,9 +11,7 @@ Example:
 import argparse
 import json
 import logging
-import re
 import sys
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from statistics import mean
 from typing import Any, Callable
@@ -54,67 +52,17 @@ def extract_gsm8k_answer(answer: str) -> str:
     return answer.split(marker)[-1].strip()
 
 
-def extract_r1_answer(response: str) -> str | None:
-    """Extract the text inside <answer>...</answer> from an r1-style response."""
-    match = re.search(r"<answer>(.*?)</answer>", response, flags=re.DOTALL)
-    if match is None:
-        return None
-    return match.group(1).strip()
-
-
-def normalize_numeric_answer(answer: str) -> str:
-    """Normalize common GSM8K final-answer formatting before exact comparison."""
-    answer = answer.strip()
-    answer = answer.replace(",", "")
-    answer = answer.replace("$", "")
-    answer = answer.rstrip(".")
-
-    number_match = re.search(r"-?\d+(?:\.\d+)?", answer)
-    if number_match is not None:
-        answer = number_match.group(0)
-
-    try:
-        decimal = Decimal(answer)
-    except InvalidOperation:
-        return answer
-    return str(decimal.normalize())
-
-
-def gsm8k_r1_reward_fn(response: str, ground_truth: str) -> dict[str, float]:
-    """
-    Lightweight GSM8K reward function.
-
-    It enforces the same r1 output tags as the assignment prompt, then compares
-    the normalized final number inside <answer>...</answer> to the GSM8K target.
-    """
-    model_answer = extract_r1_answer(response)
-    is_formatted = "</think>" in response and model_answer is not None
-    is_correct = (
-        is_formatted
-        and normalize_numeric_answer(model_answer) == normalize_numeric_answer(ground_truth)
-    )
-    return {
-        "format_reward": float(is_formatted),
-        "answer_reward": float(is_correct),
-        "reward": float(is_correct),
-    }
-
-
-def get_reward_fn() -> Callable[[str, str], dict[str, float]]:
-    """
-    Prefer the assignment's robust math grader, with a local GSM8K fallback.
-
-    The fallback keeps this script usable in lightweight environments where the
-    optional symbolic-math grader dependencies are not installed.
-    """
+def get_reward_fn() -> Callable[..., dict[str, float]]:
+    """Load the assignment's official r1_zero reward function."""
     try:
         from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-    except ModuleNotFoundError:
-        logger.warning(
-            "Could not import cs336_alignment.drgrpo_grader; falling back to "
-            "the local GSM8K numeric grader."
-        )
-        return gsm8k_r1_reward_fn
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Could not import cs336_alignment.drgrpo_grader and its "
+            "dependencies. Install the assignment grader dependencies in this "
+            "environment, or run on the server environment where they are "
+            "available."
+        ) from exc
     return r1_zero_reward_fn
 
 
@@ -128,10 +76,11 @@ def format_prompts(examples: list[dict], prompt_template: str) -> list[str]:
 
 def evaluate_vllm(
     vllm_model: Any,
-    reward_fn: Callable[[str, str], dict[str, float]],
+    reward_fn: Callable[..., dict[str, float]],
     prompts: list[str],
     ground_truths: list[str],
     eval_sampling_params: Any,
+    reward_fast: bool = True,
 ) -> tuple[list[str], list[dict[str, float]]]:
     """
     Evaluate a language model on a list of prompts.
@@ -156,7 +105,11 @@ def evaluate_vllm(
         # text starts after that token, but the reward function expects the full
         # assistant-side text when checking for </think> <answer>...</answer>.
         generation_for_reward = "<think>" + generation
-        example_metrics = reward_fn(generation_for_reward, ground_truth)
+        example_metrics = reward_fn(
+            response=generation_for_reward,
+            ground_truth=ground_truth,
+            fast=reward_fast,
+        )
 
         generations.append(generation)
         metrics.append(example_metrics)
@@ -235,8 +188,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--slow-grader",
+        action="store_true",
+        help="Use the slower math_verify fallback by setting fast=False.",
+    )
     parser.add_argument(
         "--max-examples",
         type=int,
@@ -277,6 +235,8 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
     )
 
     generations, metrics = evaluate_vllm(
@@ -285,6 +245,7 @@ def main() -> None:
         prompts=prompts,
         ground_truths=ground_truths,
         eval_sampling_params=sampling_params,
+        reward_fast=not args.slow_grader,
     )
     write_results(
         output_path=args.output_path,
@@ -310,3 +271,11 @@ if __name__ == "__main__":
     logger.info("running %s", " ".join(sys.argv))
     main()
     logger.info("finished running %s", sys.argv[0])
+
+
+
+# conda run -n cs336 python homework/evaluate_gsm8k_zero_shot.py \
+#   --data-path data/gsm8k/test.jsonl \
+#   --model-name-or-path /data/a5-alignment/models/Qwen2.5-Math-1.5B \
+#   --output-path results/gsm8k_qwen2_5_math_1_5b_zero_shot.jsonl \
+#   --max-examples 5
