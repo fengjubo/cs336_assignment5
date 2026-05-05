@@ -33,6 +33,9 @@ class SFTConfig:
     seed: int = 0
     log_every: int = 1
 
+    sample_generations: int = 3
+    sample_max_new_tokens: int = 256
+
 
 class SFTDataset(Dataset):
     def __init__(
@@ -83,6 +86,55 @@ def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+@torch.no_grad()
+def print_sample_generations(
+    model,
+    tokenizer,
+    dataset: SFTDataset,
+    device: str,
+    num_examples: int,
+    max_new_tokens: int,
+):
+    if num_examples <= 0 or len(dataset) == 0:
+        return
+
+    model.eval()
+
+    print("=" * 80)
+    print("Sample generations after SFT:")
+
+    for idx in range(min(num_examples, len(dataset))):
+        example = dataset[idx]
+        prompt = example["prompt"]
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+        ).to(device)
+
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        prompt_len = inputs["input_ids"].shape[1]
+        response_ids = output_ids[0, prompt_len:]
+        response = tokenizer.decode(
+            response_ids,
+            skip_special_tokens=True,
+        )
+
+        print("=" * 80)
+        print(f"SAMPLE {idx + 1}")
+        print("PROMPT:")
+        print(prompt)
+        print("\nMODEL OUTPUT:")
+        print(response)
 
 
 def train_sft(cfg: SFTConfig):
@@ -188,12 +240,35 @@ def train_sft(cfg: SFTConfig):
                         f"{metadata['num_response_tokens'].item()}"
                     )
 
+    if micro_step > 0 and micro_step % cfg.gradient_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            cfg.max_grad_norm,
+        )
+        optimizer.step()
+        optimizer.zero_grad()
+        global_step += 1
+        print(
+            f"global_step={global_step} "
+            f"micro_step={micro_step} "
+            "applied final partial gradient accumulation step"
+        )
+
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
     print(f"Saving model to {cfg.output_dir}")
 
     model.save_pretrained(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
+
+    print_sample_generations(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=train_dataset,
+        device=device,
+        num_examples=cfg.sample_generations,
+        max_new_tokens=cfg.sample_max_new_tokens,
+    )
 
     print("Done.")
 
