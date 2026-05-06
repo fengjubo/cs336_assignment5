@@ -58,6 +58,9 @@ class SFTVLLMEvalConfig:
     wandb_project: str = "cs336-sft"
     wandb_run_name: str | None = None
 
+    validation_curve_path: str | None = "validation_accuracy_curve.png"
+    validation_metrics_path: str | None = "validation_accuracy_curve.json"
+
 
 class SFTDataset(Dataset):
     def __init__(
@@ -77,11 +80,12 @@ class SFTDataset(Dataset):
             max_examples=None,
             seed=seed,
         )
-        validate_columns(
-            examples=self.examples,
-            required_columns=[question_column, answer_column],
-            path=path,
-        )
+        if not examples_are_prompt_response_sft(self.examples):
+            validate_columns(
+                examples=self.examples,
+                required_columns=[question_column, answer_column],
+                path=path,
+            )
 
         random.Random(seed).shuffle(self.examples)
 
@@ -93,6 +97,13 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, idx: int):
         item = self.examples[idx]
+
+        if "prompt" in item and "response" in item:
+            return {
+                "prompt": item["prompt"],
+                "response": item["response"],
+            }
+
         question = item[self.question_column]
         final_answer = extract_math12k_final_answer(item[self.answer_column])
 
@@ -146,6 +157,12 @@ def validate_columns(examples: list[dict], required_columns: list[str], path: st
             f"{path!r} is missing columns {missing_columns}. "
             f"Available columns: {available_columns}"
         )
+
+
+def examples_are_prompt_response_sft(examples: list[dict]) -> bool:
+    if not examples:
+        return False
+    return "prompt" in examples[0] and "response" in examples[0]
 
 
 def make_collate_fn(tokenizer):
@@ -385,6 +402,86 @@ def maybe_log_wandb(wandb_run, metrics: dict[str, Any]):
     wandb.log(metrics)
 
 
+def save_json(path: str | Path, data: Any):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def plot_validation_accuracy_curve(
+    eval_history: list[dict[str, Any]],
+    output_path: str | Path,
+):
+    if not eval_history:
+        print("No validation accuracy records to plot.")
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        print(
+            "matplotlib is not installed, so the validation accuracy PNG was "
+            "not created. The JSON metrics file was still saved."
+        )
+        return
+
+    train_steps = [record["train_step"] for record in eval_history]
+    accuracies = [record["accuracy"] for record in eval_history]
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_steps, accuracies, marker="o")
+    plt.xlabel("Optimizer step")
+    plt.ylabel("Validation accuracy")
+    plt.title("SFT Validation Accuracy")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+    print(f"Saved validation accuracy curve to {output_path}")
+
+
+def save_validation_outputs(
+    eval_history: list[dict[str, Any]],
+    cfg: SFTVLLMEvalConfig,
+):
+    if not eval_history:
+        return
+
+    if cfg.validation_metrics_path is not None:
+        metrics_path = Path(cfg.validation_metrics_path)
+        save_json(
+            metrics_path,
+            {
+                "train_path": cfg.train_path,
+                "eval_path": cfg.eval_path,
+                "eval_max_examples": cfg.eval_max_examples,
+                "eval_every": cfg.eval_every,
+                "results": eval_history,
+            },
+        )
+        print(f"Saved validation metrics to {metrics_path}")
+
+    if cfg.validation_curve_path is not None:
+        plot_validation_accuracy_curve(
+            eval_history=eval_history,
+            output_path=cfg.validation_curve_path,
+        )
+
+
 def run_periodic_eval(
     model,
     llm,
@@ -395,6 +492,7 @@ def run_periodic_eval(
     eval_step: int,
     cfg: SFTVLLMEvalConfig,
     wandb_run,
+    eval_history: list[dict[str, Any]] | None = None,
 ) -> int:
     print("=" * 80)
     print(f"Loading policy weights into vLLM at train_step={global_step}")
@@ -418,14 +516,25 @@ def run_periodic_eval(
         f"total={result['total']}"
     )
 
+    eval_record = {
+        "eval_step": eval_step,
+        "train_step": global_step,
+        "accuracy": result["accuracy"],
+        "correct": result["correct"],
+        "total": result["total"],
+    }
+
+    if eval_history is not None:
+        eval_history.append(eval_record)
+
     maybe_log_wandb(
         wandb_run,
         {
-            "eval_step": eval_step,
-            "train_step": global_step,
-            "eval/accuracy": result["accuracy"],
-            "eval/correct": result["correct"],
-            "eval/total": result["total"],
+            "eval_step": eval_record["eval_step"],
+            "train_step": eval_record["train_step"],
+            "eval/accuracy": eval_record["accuracy"],
+            "eval/correct": eval_record["correct"],
+            "eval/total": eval_record["total"],
         },
     )
 
@@ -523,6 +632,7 @@ def train_sft_with_vllm_eval(cfg: SFTVLLMEvalConfig):
 
     global_step = 0
     eval_step = 0
+    eval_history = []
     micro_step = 0
     examples_seen = 0
 
@@ -613,6 +723,7 @@ def train_sft_with_vllm_eval(cfg: SFTVLLMEvalConfig):
                         eval_step=eval_step,
                         cfg=cfg,
                         wandb_run=wandb_run,
+                        eval_history=eval_history,
                     )
 
     if micro_step > 0 and micro_step % cfg.gradient_accumulation_steps != 0:
@@ -646,7 +757,13 @@ def train_sft_with_vllm_eval(cfg: SFTVLLMEvalConfig):
                 eval_step=eval_step,
                 cfg=cfg,
                 wandb_run=wandb_run,
+                eval_history=eval_history,
             )
+
+    save_validation_outputs(
+        eval_history=eval_history,
+        cfg=cfg,
+    )
 
     print_sample_generations(
         model=model,
@@ -771,6 +888,18 @@ def parse_args():
         type=str,
         default=SFTVLLMEvalConfig.wandb_run_name,
     )
+    parser.add_argument(
+        "--validation-curve-path",
+        type=str,
+        default=SFTVLLMEvalConfig.validation_curve_path,
+        help="Where to save the validation accuracy curve PNG. Use 'none' to disable.",
+    )
+    parser.add_argument(
+        "--validation-metrics-path",
+        type=str,
+        default=SFTVLLMEvalConfig.validation_metrics_path,
+        help="Where to save validation accuracy records as JSON. Use 'none' to disable.",
+    )
 
     return parser.parse_args()
 
@@ -781,6 +910,13 @@ def config_from_args(args) -> SFTVLLMEvalConfig:
 
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("--gradient-accumulation-steps must be positive.")
+
+    validation_curve_path = (
+        None if args.validation_curve_path == "none" else args.validation_curve_path
+    )
+    validation_metrics_path = (
+        None if args.validation_metrics_path == "none" else args.validation_metrics_path
+    )
 
     return SFTVLLMEvalConfig(
         model_path=args.model_path,
@@ -809,6 +945,8 @@ def config_from_args(args) -> SFTVLLMEvalConfig:
         use_wandb=args.use_wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        validation_curve_path=validation_curve_path,
+        validation_metrics_path=validation_metrics_path,
     )
 
 
